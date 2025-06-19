@@ -1,0 +1,97 @@
+name: CI-CD-GKE-Deploy
+
+on:
+  push:
+    branches: ["main"]   # Trigger on push to main 
+  workflow_dispatch:     # Allow manual trigger
+
+permissions:
+  id-token: write        # Allow OIDC token retrieval for WIF
+  contents: read         # Required for actions/checkout
+
+env:
+  PROJECT_ID: "${{ secrets.GCP_PROJECT_ID }}"            # GCP Project
+  ARTIFACT_REGISTRY: "me-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/devops-demo-repo"  
+  IMAGE_NAME: "py-app"                                   # Docker image name in AR
+  GKE_CLUSTER_NAME: "devo-regional-private"                 # GKE cluster name
+  GKE_CLUSTER_LOCATION: "me-central1"                    # GKE cluster region or zone
+  K8S_NAMESPACE: "devoteam"                               # Namespace for deployment (change as needed)
+  HELM_RELEASE: "devo-app"                         # Helm release name
+
+jobs:
+  build-push:
+    name: "Build and Push Docker Image"
+    runs-on: ubuntu-latest  # Use GitHub-hosted runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Cloud Auth (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_POOL_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          
+
+      - name: Configure gcloud (install)
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+
+      - name: Build Docker image
+        run: |
+          docker build -t "$ARTIFACT_REGISTRY/$IMAGE_NAME:${{ github.sha }}" .
+        # The image is tagged with the commit SHA for uniqueness.
+
+      - name: Push to Artifact Registry
+        env:
+          CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+        run: |
+          # Configure Docker to use gcloud credentials for Artifact Registry
+          gcloud auth configure-docker ${ARTIFACT_REGISTRY%%/*} --quiet
+          docker push "$ARTIFACT_REGISTRY/$IMAGE_NAME:${{ github.sha }}"
+        # ${ARTIFACT_REGISTRY%%/*} strips the path to just the host (e.g., "me-central1-docker.pkg.dev")
+
+      - name: Export image tag
+        id: imgtag
+        run: echo "TAG=${GITHUB_SHA}" >> $GITHUB_ENV
+        # Save the image tag (sha) to an environment variable for downstream jobs
+
+  deploy:
+    name: "Deploy to Private GKE"
+    needs: [build-push]         # wait for image build to complete
+    runs-on: [self-hosted, bastion]      # target any self-hosted runner
+
+
+    steps:
+      - name: Checkout code (for Helm chart)
+        uses: actions/checkout@v3
+
+      - name: Set up Cloud Auth (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_POOL_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+
+      - name: Configure gcloud (install)
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+
+      - name: Get GKE Cluster Credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
+          location: ${{ env.GKE_CLUSTER_LOCATION }}
+          project_id: ${{ env.PROJECT_ID }}
+          use_internal_ip: true
+        # use the OIDC-authenticated gcloud to fetch and set kubeconfig for the cluster.
+
+      - name: Deploy via Helm
+        run: |
+          helm upgrade --install devo-app devo-chart --values=values.yaml --namespace=devoteam --create-namespace --set image.repository="me-central1-docker.pkg.dev/devoteam-463111/devops-demo-repo/py-app" --set image.tag="${TAG:-$GITHUB_SHA}"
+
+        # The image repository is set to Artifact Registry path, and tag is the commit SHA from earlier.

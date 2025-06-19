@@ -1,0 +1,18 @@
+replicaCount: 2            # run 2 pods for high availability
+service:
+  type: LoadBalancer
+  port: 80                 # service port (NodePort will be assigned automatically)
+  targetPort: 8000         # container port the app listens on
+resources:
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+  requests:
+    cpu: "200m"
+    memory: "128Mi"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 3
+    targetMemoryUtilizationPercentage: 80
